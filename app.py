@@ -378,16 +378,7 @@ def build_pdf(employee: str, total_min: int | None, records: list[dict],
     styles.add(ParagraphStyle(name="BodyCJK", fontName=font_name, fontSize=11, leading=15, spaceAfter=6))
     styles.add(ParagraphStyle(name="MonoCJK", fontName=font_name, fontSize=10, leading=14))
 
-# 表格要記得也指定字型
-    tbl.setStyle(TableStyle([
-        ("FONTNAME",  (0, 0), (-1, -1), font_name),
-        ("FONTSIZE",  (0, 0), (-1, -1), 10),
-        ("GRID",      (0, 0), (-1, -1), 0.25, colors.grey),
-        ("BACKGROUND",(0, 0), (-1, 0),  colors.whitesmoke),
-        ("ALIGN",     (1, 1), (-1, -1), "CENTER"),
-        ("ALIGN",     (3, 1), (3, -1),  "RIGHT"),
-        ("VALIGN",    (0, 0), (-1, -1), "MIDDLE"),
-    ]))
+
 
     story = []
 
