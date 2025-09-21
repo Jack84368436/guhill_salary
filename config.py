@@ -49,7 +49,7 @@ BONUS_COL_INDEX = 19          # 若偵測失敗會回退到此欄索引（0-base
 # 2) Linux 常見位置（Streamlit Cloud）
 # 3) Windows 常見位置（本機測試）
 PDF_FONT_CANDIDATES = [
-    str(BASE_DIR / "fonts" / "NotoSansTC-Regular.ttf"),                # 專案隨附字型（建議）
+    str(BASE_DIR / "font" / "NotoSansTC-Regular.ttf"),                # 專案隨附字型（建議）
     "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",           # Linux/雲端常見
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",          # 另一個 Linux 可能位置
     "C:/Windows/Fonts/msjh.ttc",                                       # 微軟正黑體（Windows）
