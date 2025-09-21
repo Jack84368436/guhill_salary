@@ -67,15 +67,32 @@ def get_excel_cache_key() -> str:
 
 
 # ------------------ 共用工具 ------------------
+# app.py
+from pathlib import Path
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
 def _register_cjk_font() -> str:
-    """嘗試註冊 CJK 字型，回傳註冊後的字型名稱；若失敗則回傳 'Helvetica'。"""
-    for path in PDF_FONT_CANDIDATES:
+    """
+    嘗試註冊 CJK 字型，成功回傳字型名稱 'CJK'；失敗回傳 'Helvetica'。
+    會嘗試 config.PDF_FONT_CANDIDATES 中的路徑。
+    """
+    from config import PDF_FONT_CANDIDATES  # 避免循環引用
+
+    for p in PDF_FONT_CANDIDATES:
         try:
-            pdfmetrics.registerFont(TTFont("CJK", path))
-            return "CJK"
-        except Exception:
-            continue
+            path = Path(p)
+            if path.exists():
+                pdfmetrics.registerFont(TTFont("CJK", str(path)))
+                # 讓粗體/斜體也不會回退成 Helvetica
+                pdfmetrics.registerFontFamily("CJK", normal="CJK", bold="CJK",
+                                              italic="CJK", boldItalic="CJK")
+                return "CJK"
+        except Exception as e:
+            # 你可以在 Streamlit 裡顯示 debug：st.caption(f"[debug] font register fail: {p} -> {e}")
+            pass
     return "Helvetica"
+
 
 def _norm_name(s: str) -> str:
     if s is None:
@@ -357,8 +374,20 @@ def build_pdf(employee: str, total_min: int | None, records: list[dict],
 
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="TitleCJK", fontName=font_name, fontSize=18, leading=22, spaceAfter=10))
-    styles.add(ParagraphStyle(name="H2CJK", fontName=font_name, fontSize=14, leading=18, spaceAfter=8))
+    styles.add(ParagraphStyle(name="H2CJK",   fontName=font_name, fontSize=14, leading=18, spaceAfter=8))
     styles.add(ParagraphStyle(name="BodyCJK", fontName=font_name, fontSize=11, leading=15, spaceAfter=6))
+    styles.add(ParagraphStyle(name="MonoCJK", fontName=font_name, fontSize=10, leading=14))
+
+# 表格要記得也指定字型
+    tbl.setStyle(TableStyle([
+        ("FONTNAME",  (0, 0), (-1, -1), font_name),
+        ("FONTSIZE",  (0, 0), (-1, -1), 10),
+        ("GRID",      (0, 0), (-1, -1), 0.25, colors.grey),
+        ("BACKGROUND",(0, 0), (-1, 0),  colors.whitesmoke),
+        ("ALIGN",     (1, 1), (-1, -1), "CENTER"),
+        ("ALIGN",     (3, 1), (3, -1),  "RIGHT"),
+        ("VALIGN",    (0, 0), (-1, -1), "MIDDLE"),
+    ]))
 
     story = []
 
