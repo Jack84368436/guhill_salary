@@ -2,6 +2,10 @@
 """
 集中設定：更換月份/檔名/工作表規則，只改這裡就好。
 """
+from pathlib import Path
+
+# ── 專案根目錄（給字型路徑用） ─────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent
 
 # ── 預設 Excel 檔案（當未上傳或按「改回預設檔」時使用） ─────────────────
 FILE_PATH = "salary8.xlsx"
@@ -41,13 +45,19 @@ BONUS_FIELD     = "獎金總和"   # 主要抓取的欄名；程式亦會自動�
 BONUS_COL_INDEX = 19          # 若偵測失敗會回退到此欄索引（0-based；T 欄=19）
 
 # ── PDF 用中文字型候選（reportlab 會依序嘗試註冊第一個存在的字型） ─────────
+# 1) 專案內 fonts 目錄的 NotoSansTC-Regular.ttf（強烈建議：確保雲端也找得到）
+# 2) Linux 常見位置（Streamlit Cloud）
+# 3) Windows 常見位置（本機測試）
 PDF_FONT_CANDIDATES = [
-    "NotoSansTC-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "C:/Windows/Fonts/msjh.ttc",     # 微軟正黑體
+    str(BASE_DIR / "fonts" / "NotoSansTC-Regular.ttf"),                # 專案隨附字型（建議）
+    "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",           # Linux/雲端常見
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",          # 另一個 Linux 可能位置
+    "C:/Windows/Fonts/msjh.ttc",                                       # 微軟正黑體（Windows）
     "C:/Windows/Fonts/msjh.ttf",
 ]
+
+# 在 reportlab 中註冊後使用的字型名稱（對應 app.py 的註冊名稱）
+PDF_FONT_NAME = "CJK"
 
 # CLI 互動：預設要掃描 A 欄幾列人名
 SCAN_ROWS_DEFAULT = 30
