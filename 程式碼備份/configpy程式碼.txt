@@ -1,0 +1,49 @@
+# -*- coding: utf-8 -*-
+"""
+集中設定檔：更換月份/檔名/工作表或欄位規則，只改這裡就好。
+"""
+
+# ── 出勤來源（工作表 1） ─────────────────────────────────────────────
+FILE_PATH = "salary8.xlsx"              # Excel 檔名
+SHEET_ATTEND = "工作表 1 - 2025_8月"     # 出勤資料所在工作表名稱
+
+# 出勤欄位解析規則
+START_COL = 1          # 從 B 欄開始（0-based 索引）
+DATE_ROW_INDEX = 1     # 第 2 列放日期標籤（0-based 索引 = 1）
+GROUP_STRIDE = 3       # 每組 3 欄：上班、下班、分鐘
+
+# CLI 互動：預設掃描 A 欄前幾列的人名
+SCAN_ROWS_DEFAULT = 30
+
+# ── 薪資摘要（工作表 3） ────────────────────────────────────────────
+SHEET_SUMMARY = "工作表3"   # 依你的實際分頁名調整
+
+# 需輸出的九項欄位（需與工作表3表頭一致；順序即為輸出順序）
+SUMMARY_FIELDS = [
+    "薪水",         # 基本薪水
+    "特別薪水",
+    "湊整",
+    "小結",
+    "代買",
+    "預支薪水",
+    "甜點&肉",
+    "車馬費",
+    "總計",         # 最終薪水
+]
+
+# （可選）名字在第幾欄；若你的摘要表第一欄就是姓名，就保持 0
+SUMMARY_NAME_COL_INDEX = 0
+
+# ── 獎金（工作表 2） ───────────────────────────────────────────────
+SHEET_BONUS = "工作表 2 - 2025_8月"  # 依你的實際分頁名調整
+BONUS_FIELD = "獎金總和"             # 顯示用標籤
+BONUS_COL_INDEX = 19                 # T 欄 → 0-based 索引為 19（最後備援）
+
+
+
+# ── PDF 字型候選（給 app.py 使用；test.py 不用） ───────────────
+PDF_FONT_CANDIDATES = [
+    "NotoSansTC-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",
+    "C:/Windows/Fonts/msjh.ttc",
+]

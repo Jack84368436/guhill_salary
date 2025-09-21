@@ -1,0 +1,515 @@
+# -*- coding: utf-8 -*-
+import io
+import math
+import re
+import unicodedata
+import difflib
+import hashlib
+import pandas as pd
+import streamlit as st
+
+from attendance_utils import (
+    extract_employee_records,  # 取得每日出勤紀錄（date, in, out, minutes）
+    extract_pay_items,         # 依姓名從工作表3取九項（自動略過 0）
+    fmt_ntd,                   # NT$ 千分位格式化
+    parse_ntd,                 # 解析 NT$ 或數字為 int
+)
+
+from config import (
+    FILE_PATH, SHEET_ATTEND,
+    START_COL, DATE_ROW_INDEX, GROUP_STRIDE,
+    SHEET_SUMMARY, SUMMARY_FIELDS, SUMMARY_NAME_COL_INDEX,
+    SHEET_BONUS, BONUS_FIELD, BONUS_COL_INDEX,
+    PDF_FONT_CANDIDATES,      # ← 用於中文字型註冊
+)
+
+# =============== PDF 相關（reportlab）==============
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+
+# ---- Step 1：資料來源抽象（保留；Step 2 會把上傳檔注入這裡）----
+if "excel_bytes" not in st.session_state:
+    st.session_state["excel_bytes"] = None   # 放上傳檔 bytes；None 代表用預設檔
+if "source_label" not in st.session_state:
+    st.session_state["source_label"] = f"預設檔：{FILE_PATH}"
+
+def get_active_excel_file() -> io.BytesIO | str:
+    """回傳目前生效的 Excel 來源（BytesIO 或 檔案路徑）。"""
+    if st.session_state.get("excel_bytes") is not None:
+        return io.BytesIO(st.session_state["excel_bytes"])
+    return FILE_PATH
+
+def get_active_source_label() -> str:
+    """顯示目前資料來源標籤。"""
+    return st.session_state.get("source_label", f"預設檔：{FILE_PATH}")
+
+def get_excel_cache_key() -> str:
+    """給 cache 用的 key：上傳檔用其 md5；預設檔用固定字串。"""
+    if st.session_state.get("excel_bytes") is not None:
+        md5 = hashlib.md5(st.session_state["excel_bytes"]).hexdigest()
+        return f"upload:{md5}"
+    return f"default:{FILE_PATH}"
+
+
+# ------------------ 共用工具 ------------------
+def _register_cjk_font() -> str:
+    """嘗試註冊 CJK 字型，回傳註冊後的字型名稱；若失敗則回傳 'Helvetica'。"""
+    for path in PDF_FONT_CANDIDATES:
+        try:
+            pdfmetrics.registerFont(TTFont("CJK", path))
+            return "CJK"
+        except Exception:
+            continue
+    return "Helvetica"
+
+def _norm_name(s: str) -> str:
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = s.replace("\u00A0", "").replace("\u3000", "")
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("\u200b", "").replace("\ufeff", "")
+    return s.strip()
+
+def _series_norm(sr: pd.Series) -> pd.Series:
+    return sr.astype(str).map(_norm_name)
+
+
+# ------------------ 檢核：確認上傳檔 Schema ------------------
+def _match_sheet_name(xls: pd.ExcelFile, target: str, fallback_index: int | None) -> str | None:
+    """以『去空白比對』尋找分頁，不合時可退回 fallback_index 指定的分頁名稱。"""
+    if target in xls.sheet_names:
+        return target
+    norm = lambda s: str(s).strip().replace(" ", "")
+    candidates = [s for s in xls.sheet_names if norm(s) == norm(target)]
+    if candidates:
+        return candidates[0]
+    if fallback_index is not None and len(xls.sheet_names) > fallback_index:
+        return xls.sheet_names[fallback_index]
+    return None
+
+def _validate_summary_sheet(xls: pd.ExcelFile) -> tuple[bool, str]:
+    name = _match_sheet_name(xls, SHEET_SUMMARY, fallback_index=2)
+    if not name:
+        return False, f"找不到『{SHEET_SUMMARY}』，且沒有可退回的第 3 個分頁。"
+    # 嘗試 header=1 / 0
+    for h in (1, 0):
+        try:
+            df = pd.read_excel(xls, sheet_name=name, header=h)
+            cols = [str(c).strip() for c in df.columns]
+            if all(field in cols for field in SUMMARY_FIELDS):
+                return True, ""
+        except Exception as e:
+            return False, f"讀取摘要分頁失敗：{e}"
+    return False, f"摘要分頁『{name}』缺少欄位：{[f for f in SUMMARY_FIELDS if f not in cols]}"
+
+def _validate_attend_sheet(xls: pd.ExcelFile) -> tuple[bool, str]:
+    name = _match_sheet_name(xls, SHEET_ATTEND, fallback_index=None)
+    if not name:
+        return False, f"找不到『{SHEET_ATTEND}』。"
+    try:
+        df = pd.read_excel(xls, sheet_name=name, header=1)  # 你現有邏輯：header=1 有表頭
+        if df.shape[1] < 2:
+            return False, "出勤分頁欄數異常。"
+        a = df.iloc[:, 0].dropna().astype(str).str.strip()
+        if a.empty:
+            return False, "出勤分頁 A 欄（姓名）為空。"
+        return True, ""
+    except Exception as e:
+        return False, f"讀取出勤分頁失敗：{e}"
+
+def _find_bonus_col(df: pd.DataFrame) -> int | None:
+    """與主程式同名邏輯：在欄名或前 40 列內找『獎金總和/獎金/bonus/緊急』。"""
+    keywords = ["獎金總和", "獎金", "bonus", "緊急"]
+    cols_norm = [str(c).strip().lower() for c in df.columns]
+    for k in keywords:
+        k = k.lower()
+        for idx, cname in enumerate(cols_norm):
+            if k in cname and cname != "false":
+                return idx
+    R = min(40, len(df))
+    C = len(df.columns)
+    for r in range(R):
+        for c in range(C):
+            s = str(df.iloc[r, c]).strip().lower()
+            if not s:
+                continue
+            for k in keywords:
+                if k in s:
+                    return c
+    return None
+
+def _validate_bonus_sheet(xls: pd.ExcelFile) -> tuple[bool, str]:
+    name = _match_sheet_name(xls, SHEET_BONUS, fallback_index=1)
+    if not name:
+        return False, f"找不到『{SHEET_BONUS}』，且沒有可退回的第 2 個分頁。"
+    try:
+        # header=1 / 0 皆試；只要能找到獎金欄即可
+        for h in (1, 0):
+            df = pd.read_excel(xls, sheet_name=name, header=h)
+            c = _find_bonus_col(df)
+            if c is not None:
+                return True, ""
+        return False, "獎金分頁未偵測到『獎金總和』欄位（或關鍵字）。"
+    except Exception as e:
+        return False, f"讀取獎金分頁失敗：{e}"
+
+def validate_schema(xls: pd.ExcelFile) -> tuple[bool, list[str]]:
+    """總檢核：三個分頁皆通過才算成功。回傳 (ok, problems[])。"""
+    problems: list[str] = []
+    ok1, msg1 = _validate_attend_sheet(xls)
+    ok2, msg2 = _validate_bonus_sheet(xls)
+    ok3, msg3 = _validate_summary_sheet(xls)
+    if not ok1: problems.append(f"[出勤] {msg1}")
+    if not ok2: problems.append(f"[獎金] {msg2}")
+    if not ok3: problems.append(f"[摘要] {msg3}")
+    return (len(problems) == 0, problems)
+
+
+# ------------------ 容錯讀取 工作表3（摘要/九項） ------------------
+@st.cache_data(show_spinner=False)
+def _read_summary_sheet(excel_key: str, verbose: bool = False) -> pd.DataFrame | None:
+    try:
+        xls = pd.ExcelFile(get_active_excel_file())
+        sheet_name = SHEET_SUMMARY
+        # 去空白比對 / fallback 第 3 個分頁
+        if sheet_name not in xls.sheet_names:
+            norm = lambda s: str(s).strip().replace(" ", "")
+            candidates = [s for s in xls.sheet_names if norm(s) == norm(sheet_name)]
+            if candidates:
+                sheet_name = candidates[0]
+            elif len(xls.sheet_names) >= 3:
+                sheet_name = xls.sheet_names[2]
+            else:
+                return None
+
+        def _load_with_header(h):
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=h)
+            df.columns = df.columns.map(lambda s: str(s).strip())
+            try:
+                col = df.iloc[:, SUMMARY_NAME_COL_INDEX].astype("object")
+                df.iloc[:, SUMMARY_NAME_COL_INDEX] = col.astype(str).str.strip()
+            except Exception:
+                pass
+            if False in df.columns:  # 偶發布林欄
+                df = df.drop(columns=[False])
+            return df
+
+        df_sum = _load_with_header(1)
+        if not any(col in df_sum.columns for col in SUMMARY_FIELDS):
+            df_sum = _load_with_header(0)
+        return df_sum
+    except Exception:
+        return None
+
+
+# ------------------ 讀取工作表2（獎金） ------------------
+@st.cache_data(show_spinner=False)
+def _read_bonus_sheet(excel_key: str, verbose: bool = False) -> pd.DataFrame | None:
+    try:
+        xls = pd.ExcelFile(get_active_excel_file())
+        sheet_name = SHEET_BONUS
+        # 去空白比對 / fallback 第 2 個分頁
+        if sheet_name not in xls.sheet_names:
+            norm = lambda s: str(s).strip().replace(" ", "")
+            candidates = [s for s in xls.sheet_names if norm(s) == norm(sheet_name)]
+            if candidates:
+                sheet_name = candidates[0]
+            elif len(xls.sheet_names) >= 2:
+                sheet_name = xls.sheet_names[1]
+            else:
+                return None
+
+        def _load(h):
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=h)
+            df.columns = df.columns.map(lambda s: str(s).strip())
+            if False in df.columns:
+                df = df.drop(columns=[False])
+            return df
+
+        df_bonus = _load(1)
+        if df_bonus.shape[1] <= BONUS_COL_INDEX:
+            df_bonus = _load(0)
+        return df_bonus
+    except Exception:
+        return None
+
+
+def _guess_name_col_in_bonus(df_bonus: pd.DataFrame, att_names: set[str], verbose: bool=False) -> int | None:
+    att_norm = {_norm_name(x) for x in att_names if x is not None}
+    best_i, best_hit = None, -1
+    for i in range(len(df_bonus.columns)):
+        col_vals = _series_norm(df_bonus.iloc[:, i])
+        hit = col_vals.isin(att_norm).sum()
+        if hit > best_hit:
+            best_i, best_hit = i, hit
+    return best_i if best_hit > 0 else None
+
+def _find_bonus_col_for_runtime(df: pd.DataFrame, verbose: bool=False) -> int | None:
+    """執行期找獎金欄（與檢核共用思路）。"""
+    return _find_bonus_col(df)
+
+def _find_row_anywhere_by_name(df_bonus: pd.DataFrame, target_norm: str, min_ratio: float = 0.70):
+    best = None
+    R, C = df_bonus.shape
+    for c in range(C):
+        col_norm = _series_norm(df_bonus.iloc[:, c].astype(str))
+        idx = col_norm[col_norm == target_norm].index
+        if len(idx) > 0:
+            r = int(idx[0])
+            raw = df_bonus.iloc[r, c]
+            return (r, c, str(raw), 1.0)
+    for r in range(R):
+        row = df_bonus.iloc[r, :]
+        for c in range(C):
+            raw = str(row.iloc[c])
+            nm = _norm_name(raw)
+            if not nm:
+                continue
+            ratio = difflib.SequenceMatcher(None, target_norm, nm).ratio()
+            if best is None or ratio > best[0]:
+                best = (ratio, r, c, raw)
+    if best and best[0] >= min_ratio:
+        ratio, r, c, raw = best
+        return (r, c, raw, ratio)
+    return None
+
+def _get_bonus_by_name(df_bonus: pd.DataFrame, target: str, att_names: set[str],
+                       verbose: bool = False) -> int | None:
+    """統一簽名（含 verbose），避免呼叫端參數不一致。"""
+    if df_bonus is None:
+        return None
+    name_col = _guess_name_col_in_bonus(df_bonus, att_names, verbose)
+    target_norm = _norm_name(target)
+    r = None
+
+    if name_col is not None:
+        names_norm = _series_norm(df_bonus.iloc[:, name_col].astype(str))
+        idx = names_norm[names_norm == target_norm].index
+        if len(idx) > 0:
+            r = int(idx[0])
+
+    if r is None:
+        C = df_bonus.shape[1]
+        found = False
+        for c_try in range(C):
+            col_norm = _series_norm(df_bonus.iloc[:, c_try].astype(str))
+            idx = col_norm[col_norm == target_norm].index
+            if len(idx) > 0:
+                r = int(idx[0])
+                name_col = c_try
+                found = True
+                break
+
+        if not found:
+            hit = _find_row_anywhere_by_name(df_bonus, target_norm, min_ratio=0.70)
+            if hit is not None:
+                r, name_col, raw_cell, ratio = hit
+            else:
+                return None
+
+    c = _find_bonus_col_for_runtime(df_bonus, verbose)
+    if c is None:
+        c = BONUS_COL_INDEX
+
+    if r < 0 or r >= len(df_bonus) or c < 0 or c >= len(df_bonus.columns):
+        return None
+
+    val = df_bonus.iloc[r, c]
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return None
+    n = parse_ntd(val)
+    return n if n != 0 else None
+
+
+# ------------------ PDF 產生 ------------------
+def build_pdf(employee: str, total_min: int | None, records: list[dict],
+              bonus_amt: int | None, pay_items: dict) -> bytes:
+    buf = io.BytesIO()
+    font_name = _register_cjk_font()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=28, rightMargin=28, topMargin=28, bottomMargin=28
+    )
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="TitleCJK", fontName=font_name, fontSize=18, leading=22, spaceAfter=10))
+    styles.add(ParagraphStyle(name="H2CJK", fontName=font_name, fontSize=14, leading=18, spaceAfter=8))
+    styles.add(ParagraphStyle(name="BodyCJK", fontName=font_name, fontSize=11, leading=15, spaceAfter=6))
+
+    story = []
+
+    story.append(Paragraph(f"{employee} 出勤報表", styles["TitleCJK"]))
+    t_min = total_min or 0
+    t_days = len(records)
+    t_hours = round(t_min / 60, 2) if total_min is not None else 0.0
+    story.append(Paragraph(f"出勤天數：{t_days} 天；總分鐘數：{t_min:,} 分；約 {t_hours} 小時", styles["BodyCJK"]))
+    story.append(Spacer(1, 6))
+
+    if records:
+        table_data = [["日期", "上班", "下班", "分鐘"]]
+        for r in records:
+            table_data.append([r["date"], r["in"], r["out"], f'{r["minutes"]:,}'])
+        tbl = Table(table_data, colWidths=[90, 80, 80, 60])
+        tbl.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), font_name),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+            ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+            ("ALIGN", (3, 1), (3, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 10))
+
+    story.append(Paragraph("薪資明細", styles["H2CJK"]))
+    printed_any = False
+    if bonus_amt is not None and bonus_amt > 0:
+        story.append(Paragraph(f"- {BONUS_FIELD}：{fmt_ntd(bonus_amt)}", styles["BodyCJK"]))
+        printed_any = True
+    for key in SUMMARY_FIELDS:
+        if key in pay_items:
+            story.append(Paragraph(f"- {key}：{fmt_ntd(pay_items[key])}", styles["BodyCJK"]))
+            printed_any = True
+    if not printed_any:
+        story.append(Paragraph("（此員工沒有可顯示的薪資明細）", styles["BodyCJK"]))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ------------------ 主 UI ------------------
+def main():
+    st.set_page_config(page_title="出勤與薪資總覽", page_icon="🗂️", layout="wide")
+    st.title("出勤與薪資總覽")
+
+    with st.sidebar:
+        st.header("📂 上傳/切換資料來源")
+        uploaded = st.file_uploader("上傳薪資 Excel（.xlsx）", type=["xlsx"])
+        if uploaded is not None:
+            try:
+                excel_bytes = uploaded.getvalue()
+                xls = pd.ExcelFile(io.BytesIO(excel_bytes))
+                ok, problems = validate_schema(xls)
+                if ok:
+                    st.success("✅ 格式檢核通過，點擊下方按鈕採用此檔案。")
+                    if st.button("採用此檔案", type="primary"):
+                        st.session_state["excel_bytes"] = excel_bytes
+                        st.session_state["source_label"] = f"上傳檔：{uploaded.name}"
+                        st.rerun()
+                else:
+                    st.error("❌ 格式檢核失敗：")
+                    for p in problems:
+                        st.write("-", p)
+            except Exception as e:
+                st.error(f"讀取上傳檔失敗：{e}")
+
+        if st.button("改回預設檔"):
+            st.session_state["excel_bytes"] = None
+            st.session_state["source_label"] = f"預設檔：{FILE_PATH}"
+            st.rerun()
+
+    # 顯示目前資料來源
+    st.caption(f"目前資料表：{get_active_source_label()}")
+
+    # 讀工作表1（出勤）——透過 active source
+    xls_att = pd.ExcelFile(get_active_excel_file())
+    df_raw = pd.read_excel(xls_att, sheet_name=SHEET_ATTEND, header=None)
+    df_att = pd.read_excel(xls_att, sheet_name=SHEET_ATTEND, header=1)
+
+    # 提供「掃描 A 欄前幾列」的控制
+    max_rows = len(df_att)
+    scan_rows = st.number_input("掃描 A 欄前幾列（人名）", min_value=1, max_value=max_rows, value=min(30, max_rows), step=1)
+
+    # 員工清單（A 欄）
+    names = df_att.iloc[:scan_rows, 0].dropna().astype(str).str.strip().tolist()
+    target = st.selectbox("選擇員工姓名", names, index=0)
+
+    # 出勤紀錄
+    total_min, records = extract_employee_records(
+        df_raw, df_att, target,
+        scan_rows=scan_rows,
+        start_col=START_COL,
+        date_row_index=DATE_ROW_INDEX,
+        group_stride=GROUP_STRIDE,
+    )
+
+    if total_min is None and not records:
+        st.warning("找不到對應資料！")
+        return
+
+    # 概覽 metrics
+    col_top1, col_top2, col_top3 = st.columns([1,1,1])
+    with col_top1:
+        st.metric("出勤天數", f"{len(records)} 天")
+    with col_top2:
+        st.metric("總分鐘數", f"{(total_min or 0):,} 分")
+    with col_top3:
+        st.metric("總時數(約)", f"{round((total_min or 0)/60, 2)} 小時")
+
+    # 出勤明細表
+    if records:
+        df_show = pd.DataFrame(records, columns=["date", "in", "out", "minutes"]).rename(
+            columns={"date":"日期", "in":"上班", "out":"下班", "minutes":"分鐘"}
+        )
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── 薪資明細（工作表2 + 工作表3）----
+    st.subheader("薪資明細")
+
+    # cache key（切換來源時刷新 cache）
+    excel_key = get_excel_cache_key()
+
+    # 讀工作表3（九項）— 容錯讀表 + cache
+    df_sum = _read_summary_sheet(excel_key, False)
+    if df_sum is None:
+        pay_items = {}
+    else:
+        try:
+            pay_items = extract_pay_items(df_sum, target, SUMMARY_FIELDS)
+        except Exception:
+            pay_items = {}
+
+    # 讀工作表2（獎金）— 容錯讀表 + cache
+    df_bonus = _read_bonus_sheet(excel_key, False)
+    att_names = set(_series_norm(df_att.iloc[:, 0]))
+    bonus_amt = _get_bonus_by_name(df_bonus, target, att_names, False) if df_bonus is not None else None
+
+    printed_any = False
+    if bonus_amt is not None and bonus_amt > 0:
+        st.markdown(f"- **{BONUS_FIELD}**：{fmt_ntd(bonus_amt)}")
+        printed_any = True
+    for key in SUMMARY_FIELDS:
+        if key in pay_items:
+            st.markdown(f"- **{key}**：{fmt_ntd(pay_items[key])}")
+            printed_any = True
+    if not printed_any:
+        st.info("此員工沒有可顯示的薪資明細（九項皆為 0，且未找到有效獎金）。")
+
+    # ===== 下載 PDF 按鈕（包含薪資明細）=====
+    pdf_bytes = build_pdf(
+        employee=target,
+        total_min=total_min,
+        records=records,
+        bonus_amt=bonus_amt,
+        pay_items=pay_items
+    )
+    st.download_button(
+        label="⬇️ 下載 PDF 報表",
+        data=pdf_bytes,
+        file_name=f"{target}_出勤報表.pdf",
+        mime="application/pdf"
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# venv
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Streamlit caches
+.streamlit/secrets.toml
