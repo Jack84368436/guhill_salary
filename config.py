@@ -49,11 +49,15 @@ BONUS_COL_INDEX = 19          # 若偵測失敗會回退到此欄索引（0-base
 # 2) Linux 常見位置（Streamlit Cloud）
 # 3) Windows 常見位置（本機測試）
 PDF_FONT_CANDIDATES = [
-    str(BASE_DIR / "font" / "NotoSansTC-Regular.ttf"),                # 專案隨附字型（建議）
-    "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",           # Linux/雲端常見
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",          # 另一個 Linux 可能位置
-    "C:/Windows/Fonts/msjh.ttc",                                       # 微軟正黑體（Windows）
-    "C:/Windows/Fonts/msjh.ttf",
+    # 1) 你專案裡的字型（相對路徑，Linux/雲端也能用）
+    "font/Noto_Sans_TC/static/NotoSansTC-Regular.ttf",
+
+    # 2) Windows 的備援字型（本機跑得到、雲端會略過）
+    "C:/Windows/Fonts/msjh.ttc",
+
+    # 3) Linux 的備援字型（Streamlit Cloud / Linux 主機）
+    "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 ]
 
 # 在 reportlab 中註冊後使用的字型名稱（對應 app.py 的註冊名稱）
